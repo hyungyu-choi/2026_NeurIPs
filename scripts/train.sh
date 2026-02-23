@@ -1,36 +1,56 @@
 #!/bin/bash
 
 # ========================
-# 학습 설정
+# Temporal Ordering ViT - 학습 설정
 # ========================
-NAME="cifar10-run"
-DATASET="cifar10"          # cifar10 or cifar100
+NAME="cholec80-temporal-ordering"
 MODEL_TYPE="ViT-B_16"
-# PRETRAINED_DIR="checkpoint/ViT-B_16.npz"
+# PRETRAINED_DIR="checkpoint/ViT-B_16.npz"   # pretrained 사용 시 주석 해제
 OUTPUT_DIR="output"
 
-IMG_SIZE=224
-TRAIN_BATCH_SIZE=256
-EVAL_BATCH_SIZE=64
-EVAL_EVERY=100
+# Dataset
+DATA_ROOT="../code/Dataset/cholec80/frames/extract_1fps/training_set"
+# VAL_ROOT="../code/Dataset/cholec80/frames/extract_1fps/val_set"   # validation 있으면 주석 해제
 
-LEARNING_RATE=3e-2
-WEIGHT_DECAY=0
-NUM_STEPS=10000
+# Temporal sampling
+IMG_SIZE=224
+SEQ_LEN=8
+MIN_STEP=1
+MAX_STEP=20
+SAMPLING_MODE="global"    # "randstep" or "global"
+
+# Temporal Head
+HIDDEN_MUL=0.5
+TEMPORAL_MAX_LEN=64
+TEMPORAL_N_LAYERS=6
+TEMPORAL_N_HEAD=8
+TEMPORAL_DROPOUT=0.1
+
+# Plackett-Luce loss
+PL_SAMPLE=""                # "--pl_sample" 로 설정하면 subset sampling 사용
+PL_R=4
+PL_K=8
+
+# Training
+TRAIN_BATCH_SIZE=32
+EVAL_BATCH_SIZE=16
+EVAL_EVERY=500
+
+LEARNING_RATE=1e-4
+WEIGHT_DECAY=0.05
+NUM_STEPS=50000
 DECAY_TYPE="cosine"
-WARMUP_STEPS=500
+WARMUP_STEPS=1000
 MAX_GRAD_NORM=1.0
 SEED=42
 GRADIENT_ACCUMULATION_STEPS=1
+FP16=""                     # "--fp16" 으로 설정하면 mixed precision 사용
 
 # ========================
 # GPU 설정
 # ========================
-# 사용할 GPU 번호 (예: "0" / "0,1" / "0,1,2,3")
 GPU_IDS="3"
-
-# 학습 모드 선택: "single" 또는 "multi"
-MODE="single"
+MODE="single"               # "single" 또는 "multi"
 
 # ========================
 # 실행
@@ -39,10 +59,21 @@ NUM_GPUS=$(echo $GPU_IDS | tr ',' '\n' | wc -l)
 
 COMMON_ARGS="
     --name $NAME \
-    --dataset $DATASET \
     --model_type $MODEL_TYPE \
     --output_dir $OUTPUT_DIR \
+    --data_root $DATA_ROOT \
     --img_size $IMG_SIZE \
+    --seq_len $SEQ_LEN \
+    --min_step $MIN_STEP \
+    --max_step $MAX_STEP \
+    --sampling_mode $SAMPLING_MODE \
+    --hidden_mul $HIDDEN_MUL \
+    --temporal_max_len $TEMPORAL_MAX_LEN \
+    --temporal_n_layers $TEMPORAL_N_LAYERS \
+    --temporal_n_head $TEMPORAL_N_HEAD \
+    --temporal_dropout $TEMPORAL_DROPOUT \
+    --pl_R $PL_R \
+    --pl_K $PL_K \
     --train_batch_size $TRAIN_BATCH_SIZE \
     --eval_batch_size $EVAL_BATCH_SIZE \
     --eval_every $EVAL_EVERY \
@@ -56,10 +87,11 @@ COMMON_ARGS="
     --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS
 "
 
-# pretrained_dir가 설정된 경우에만 추가
-if [ ! -z "$PRETRAINED_DIR" ]; then
-    COMMON_ARGS="$COMMON_ARGS --pretrained_dir $PRETRAINED_DIR"
-fi
+# Optional flags
+[ ! -z "$PRETRAINED_DIR" ] && COMMON_ARGS="$COMMON_ARGS --pretrained_dir $PRETRAINED_DIR"
+[ ! -z "$VAL_ROOT" ]       && COMMON_ARGS="$COMMON_ARGS --val_root $VAL_ROOT"
+[ ! -z "$PL_SAMPLE" ]      && COMMON_ARGS="$COMMON_ARGS $PL_SAMPLE"
+[ ! -z "$FP16" ]            && COMMON_ARGS="$COMMON_ARGS $FP16"
 
 if [ "$MODE" = "single" ]; then
     echo "=============================="
