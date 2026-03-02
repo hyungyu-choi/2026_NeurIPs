@@ -1,9 +1,16 @@
 # coding=utf-8
 """
-Train ViT with hyperbolic entailment loss on Lorentz hyperboloid.
+Train ViT with MERU-style hyperbolic entailment loss on Lorentz hyperboloid.
 
-Each frame's CLS token is projected onto the hyperboloid.
+Each frame's CLS token is projected onto the hyperboloid via exp_map at origin.
 Earlier frames entail later frames (closer to apex = more general).
+
+Key differences from the previous geoopt-based version:
+  - Only space components are stored (time computed on-the-fly)
+  - Learnable curvature parameter (stored as log, following MERU)
+  - Learnable alpha scaling before exp_map
+  - Entailment loss: clamp(oxy_angle - half_aperture, min=0)
+  - No geoopt dependency
 """
 from __future__ import absolute_import, division, print_function
 
@@ -21,6 +28,12 @@ from torch.cuda.amp import GradScaler, autocast
 
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
+
+try:
+    import wandb
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
 
 from models.modeling import CONFIGS
 from models.temporal_vit import (
@@ -56,7 +69,9 @@ class AverageMeter:
 def save_model(args, model, step=None):
     model_to_save = model.module if hasattr(model, 'module') else model
     suffix = f"_step{step}" if step else ""
-    path = os.path.join(args.output_dir, f"{args.name}{suffix}_checkpoint.bin")
+    save_dir = os.path.join(args.output_dir, args.name)
+    os.makedirs(save_dir, exist_ok=True)
+    path = os.path.join(save_dir, f"{args.name}{suffix}_checkpoint.bin")
     torch.save(model_to_save.state_dict(), path)
     logger.info(f"Saved model checkpoint to {path}")
 
@@ -90,8 +105,9 @@ def setup(args):
         config,
         img_size=args.img_size,
         pretrained_weights=pretrained_weights,
-        hyp_dim=args.hyp_dim,
-        curvature=args.curvature,
+        embed_dim=args.embed_dim,
+        curv_init=args.curv_init,
+        learn_curv=args.learn_curv,
         zero_head=True,
     )
     model.to(args.device)
@@ -121,16 +137,18 @@ def valid(args, model, criterion, writer, test_loader, global_step):
     total_ordering_acc = 0.0
     total_cone_acc = 0.0
     n_batches = 0
-    K_val = criterion.K_aperture.item()
+
+    model_to_use = model.module if hasattr(model, 'module') else model
+    _curv = model_to_use.curvature.detach()
 
     for step, batch in enumerate(epoch_iterator):
         x = batch.to(args.device)              # [B, T, 3, H, W]
-        h = model(x)                           # [B, T, D+1]
-        loss = criterion(h)
-        eval_losses.update(loss.item())
+        h = model(x)                           # [B, T, D] space components
+        loss_dict = criterion(h, _curv)
+        eval_losses.update(loss_dict["loss"].item())
 
-        total_ordering_acc += hyperbolic_ordering_accuracy(h, criterion.manifold)
-        total_cone_acc += hyperbolic_cone_accuracy(h, K_val, criterion.manifold)
+        total_ordering_acc += hyperbolic_ordering_accuracy(h, _curv)
+        total_cone_acc += hyperbolic_cone_accuracy(h, _curv, args.min_radius)
         n_batches += 1
 
         epoch_iterator.set_description(f"Validating... (loss={eval_losses.val:.5f})")
@@ -146,6 +164,15 @@ def valid(args, model, criterion, writer, test_loader, global_step):
     writer.add_scalar("val/loss", eval_losses.avg, global_step)
     writer.add_scalar("val/ordering_accuracy", ordering_acc, global_step)
     writer.add_scalar("val/cone_accuracy", cone_acc, global_step)
+
+    if args.use_wandb:
+        wandb.log({
+            "val/loss": eval_losses.avg,
+            "val/ordering_accuracy": ordering_acc,
+            "val/cone_accuracy": cone_acc,
+            "step": global_step,
+        })
+
     return eval_losses.avg
 
 
@@ -157,23 +184,59 @@ def train(args, model):
         os.makedirs(args.output_dir, exist_ok=True)
         writer = SummaryWriter(log_dir=os.path.join("logs", args.name))
 
+        # ── Wandb init ──
+        if args.use_wandb:
+            if not HAS_WANDB:
+                logger.warning("wandb not installed. pip install wandb")
+                args.use_wandb = False
+            else:
+                wandb.init(
+                    project=args.wandb_project,
+                    entity=args.wandb_entity,
+                    name=args.name,
+                    config={
+                        "model_type": args.model_type,
+                        "img_size": args.img_size,
+                        "seq_len": args.seq_len,
+                        "embed_dim": args.embed_dim,
+                        "curv_init": args.curv_init,
+                        "learn_curv": args.learn_curv,
+                        "min_radius": args.min_radius,
+                        "height_margin": args.height_margin,
+                        "height_weight": args.height_weight,
+                        "cone_weight": args.cone_weight,
+                        "learning_rate": args.learning_rate,
+                        "weight_decay": args.weight_decay,
+                        "num_steps": args.num_steps,
+                        "warmup_steps": args.warmup_steps,
+                        "max_grad_norm": args.max_grad_norm,
+                        "train_batch_size": args.train_batch_size,
+                        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                        "sampling_mode": args.sampling_mode,
+                        "min_step": args.min_step,
+                        "max_step": args.max_step,
+                        "fp16": args.fp16,
+                        "seed": args.seed,
+                    },
+                )
+                wandb.watch(model, log="gradients", log_freq=100)
+
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
     # Data
     train_loader, test_loader = get_loader(args)
 
-    # Loss (has learnable K_aperture parameter)
+    # Loss (no learnable params — curvature comes from model)
     criterion = HyperbolicEntailmentLoss(
-        curvature=args.curvature,
+        min_radius=args.min_radius,
         height_margin=args.height_margin,
-        cone_margin=args.cone_margin,
         height_weight=args.height_weight,
         cone_weight=args.cone_weight,
-    ).to(args.device)
+    )
 
-    # Optimizer: model params + loss params (K_aperture)
+    # Optimizer (model params include curvature & alpha)
     optimizer = torch.optim.AdamW(
-        list(model.parameters()) + list(criterion.parameters()),
+        model.parameters(),
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
@@ -192,13 +255,16 @@ def train(args, model):
         model = DDP(model, device_ids=[args.local_rank], find_unused_parameters=False)
 
     # ── Training loop ──
-    logger.info("***** Running Hyperbolic Entailment Training *****")
+    model_to_use = model.module if hasattr(model, 'module') else model
+
+    logger.info("***** Running MERU-style Hyperbolic Entailment Training *****")
     logger.info(f"  Total optimization steps = {args.num_steps}")
     logger.info(f"  Batch size per GPU       = {args.train_batch_size}")
     logger.info(f"  Gradient accumulation    = {args.gradient_accumulation_steps}")
     logger.info(f"  Seq len (frames/clip)    = {args.seq_len}")
-    logger.info(f"  Hyperbolic dim           = {args.hyp_dim}")
-    logger.info(f"  Curvature                = {args.curvature}")
+    logger.info(f"  Embedding dim            = {args.embed_dim}")
+    logger.info(f"  Initial curvature        = {args.curv_init}")
+    logger.info(f"  Learn curvature          = {args.learn_curv}")
 
     model.zero_grad()
     set_seed(args)
@@ -223,8 +289,10 @@ def train(args, model):
             x = batch.to(args.device)  # [B, T, 3, H, W]
 
             with autocast(enabled=args.fp16):
-                h = model(x)            # [B, T, D+1]
-                loss = criterion(h)
+                h = model(x)                           # [B, T, D] space components
+                _curv = model_to_use.curvature
+                loss_dict = criterion(h, _curv)
+                loss = loss_dict["loss"]
 
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
@@ -235,10 +303,15 @@ def train(args, model):
                 losses.update(loss.item() * args.gradient_accumulation_steps)
 
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    list(model.parameters()) + list(criterion.parameters()),
-                    args.max_grad_norm,
-                )
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+                # Compute gradient norm BEFORE zero_grad
+                if args.local_rank in [-1, 0] and args.use_wandb:
+                    total_grad_norm = 0.0
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            total_grad_norm += p.grad.data.norm(2).item() ** 2
+                    total_grad_norm = total_grad_norm ** 0.5
 
                 scaler.step(optimizer)
                 scaler.update()
@@ -252,9 +325,33 @@ def train(args, model):
 
                 if args.local_rank in [-1, 0]:
                     writer.add_scalar("train/loss", losses.val, global_step)
+                    writer.add_scalar("train/entailment_loss",
+                                      loss_dict["entailment_loss"].item(), global_step)
+                    writer.add_scalar("train/height_loss",
+                                      loss_dict["height_loss"].item(), global_step)
                     writer.add_scalar("train/lr", scheduler.get_lr()[0], global_step)
-                    writer.add_scalar("train/K_aperture",
-                                      criterion.K_aperture.item(), global_step)
+                    writer.add_scalar("train/curvature",
+                                      model_to_use.curvature.item(), global_step)
+
+                    if args.use_wandb:
+                        # Embedding stats (space component norms)
+                        with torch.no_grad():
+                            h_norms = h.float().norm(dim=-1)  # (B, T)
+
+                        wandb.log({
+                            "train/loss": losses.val,
+                            "train/loss_avg": losses.avg,
+                            "train/entailment_loss": loss_dict["entailment_loss"].item(),
+                            "train/height_loss": loss_dict["height_loss"].item(),
+                            "train/lr": scheduler.get_lr()[0],
+                            "train/curvature": model_to_use.curvature.item(),
+                            "train/alpha": model_to_use.lorentz_proj.alpha.exp().item(),
+                            "train/grad_norm": total_grad_norm,
+                            "train/embed_norm_mean": h_norms.mean().item(),
+                            "train/embed_norm_max": h_norms.max().item(),
+                            "train/embed_norm_min": h_norms.min().item(),
+                            "step": global_step,
+                        })
 
                 # Validation
                 if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
@@ -278,10 +375,9 @@ def train(args, model):
     # Final save
     if args.local_rank in [-1, 0]:
         save_model(args, model, step=global_step)
-        # Save loss params (K_aperture) separately
-        loss_path = os.path.join(args.output_dir, f"{args.name}_loss_params.bin")
-        torch.save(criterion.state_dict(), loss_path)
         writer.close()
+        if args.use_wandb:
+            wandb.finish()
 
     logger.info(f"Best validation loss: {best_loss:.5f}")
     logger.info("End Training!")
@@ -313,21 +409,25 @@ def main():
     parser.add_argument("--sampling_mode", default="randstep",
                         choices=["randstep", "global"])
 
-    # Hyperbolic
-    parser.add_argument("--hyp_dim", default=128, type=int,
-                        help="Dimension of hyperbolic embeddings (output is hyp_dim+1).")
-    parser.add_argument("--curvature", default=1.0, type=float,
-                        help="Curvature K for Lorentz model (manifold curvature = -1/K).")
+    # Hyperbolic (MERU-style)
+    parser.add_argument("--embed_dim", default=128, type=int,
+                        help="Dimension of hyperbolic embeddings (space components).")
+    parser.add_argument("--curv_init", default=1.0, type=float,
+                        help="Initial curvature (positive). Hyperboloid curvature = -curv.")
+    parser.add_argument("--learn_curv", action="store_true", default=True,
+                        help="Learn the curvature parameter during training.")
+    parser.add_argument("--no_learn_curv", dest="learn_curv", action="store_false",
+                        help="Fix the curvature parameter.")
 
     # Entailment loss
+    parser.add_argument("--min_radius", default=0.1, type=float,
+                        help="Min radius for half-aperture computation (MERU K parameter).")
     parser.add_argument("--height_margin", default=0.1, type=float,
                         help="Margin for height ordering loss.")
-    parser.add_argument("--cone_margin", default=0.05, type=float,
-                        help="Margin for cone inclusion loss.")
     parser.add_argument("--height_weight", default=1.0, type=float,
                         help="Weight for height ordering loss.")
     parser.add_argument("--cone_weight", default=1.0, type=float,
-                        help="Weight for cone inclusion loss.")
+                        help="Weight for entailment cone loss.")
 
     # Training
     parser.add_argument("--train_batch_size", default=32, type=int)
@@ -345,6 +445,14 @@ def main():
     # Distributed
     parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--seed", type=int, default=42)
+
+    # Wandb
+    parser.add_argument("--use_wandb", action="store_true",
+                        help="Enable wandb logging.")
+    parser.add_argument("--wandb_project", type=str, default="hyperbolic-temporal-vit",
+                        help="Wandb project name.")
+    parser.add_argument("--wandb_entity", type=str, default=None,
+                        help="Wandb entity (team or username).")
 
     args = parser.parse_args()
 

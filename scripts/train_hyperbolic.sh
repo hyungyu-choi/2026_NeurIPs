@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # ========================
-# Hyperbolic Entailment ViT - 학습 설정
+# MERU-style Hyperbolic Entailment ViT - 학습 설정
 # ========================
-NAME="cholec80-hyperbolic-entailment"
+NAME="cholec80-hyperbolic-meru"
 MODEL_TYPE="ViT-B_16"
 # PRETRAINED_DIR="checkpoint/ViT-B_16.npz"   # pretrained 사용 시 주석 해제
 OUTPUT_DIR="output"
@@ -19,13 +19,14 @@ MIN_STEP=1
 MAX_STEP=20
 SAMPLING_MODE="global"
 
-# Hyperbolic space
-HYP_DIM=128               # 하이퍼볼릭 임베딩 차원 (출력은 HYP_DIM+1)
-CURVATURE=1.0              # Lorentz model curvature K
+# Hyperbolic space (MERU-style)
+EMBED_DIM=128              # 하이퍼볼릭 임베딩 차원 (space components only)
+CURV_INIT=1.0              # 초기 곡률 (양수, hyperboloid curvature = -curv)
+LEARN_CURV="--learn_curv"  # 곡률 학습 여부 (빈 문자열이면 고정)
 
 # Entailment loss
+MIN_RADIUS=0.1             # half-aperture의 min_radius (MERU의 K 파라미터)
 HEIGHT_MARGIN=0.1          # height ordering margin
-CONE_MARGIN=0.05           # cone inclusion margin
 HEIGHT_WEIGHT=1.0          # height loss 가중치
 CONE_WEIGHT=1.0            # cone loss 가중치
 
@@ -44,10 +45,15 @@ SEED=42
 GRADIENT_ACCUMULATION_STEPS=1
 FP16=""                     # "--fp16" 으로 설정하면 mixed precision 사용
 
+# Wandb
+USE_WANDB="--use_wandb"    # 빈 문자열이면 wandb 비활성화
+WANDB_PROJECT="hyperbolic-temporal-vit"
+# WANDB_ENTITY=""           # wandb team/username (옵션)
+
 # ========================
 # GPU 설정
 # ========================
-GPU_IDS="2"
+GPU_IDS="1"
 MODE="single"
 
 # ========================
@@ -65,10 +71,10 @@ COMMON_ARGS="
     --min_step $MIN_STEP \
     --max_step $MAX_STEP \
     --sampling_mode $SAMPLING_MODE \
-    --hyp_dim $HYP_DIM \
-    --curvature $CURVATURE \
+    --embed_dim $EMBED_DIM \
+    --curv_init $CURV_INIT \
+    --min_radius $MIN_RADIUS \
     --height_margin $HEIGHT_MARGIN \
-    --cone_margin $CONE_MARGIN \
     --height_weight $HEIGHT_WEIGHT \
     --cone_weight $CONE_WEIGHT \
     --train_batch_size $TRAIN_BATCH_SIZE \
@@ -87,11 +93,14 @@ COMMON_ARGS="
 # Optional flags
 [ ! -z "$PRETRAINED_DIR" ] && COMMON_ARGS="$COMMON_ARGS --pretrained_dir $PRETRAINED_DIR"
 [ ! -z "$VAL_ROOT" ]       && COMMON_ARGS="$COMMON_ARGS --val_root $VAL_ROOT"
+[ ! -z "$LEARN_CURV" ]     && COMMON_ARGS="$COMMON_ARGS $LEARN_CURV"
 [ ! -z "$FP16" ]            && COMMON_ARGS="$COMMON_ARGS $FP16"
+[ ! -z "$USE_WANDB" ]      && COMMON_ARGS="$COMMON_ARGS $USE_WANDB --wandb_project $WANDB_PROJECT"
+[ ! -z "$WANDB_ENTITY" ]   && COMMON_ARGS="$COMMON_ARGS --wandb_entity $WANDB_ENTITY"
 
 if [ "$MODE" = "single" ]; then
     echo "=============================="
-    echo "Hyperbolic Entailment 학습 시작"
+    echo "MERU-style Hyperbolic Entailment 학습 시작"
     echo "사용 GPU: $GPU_IDS"
     echo "=============================="
     CUDA_VISIBLE_DEVICES=$GPU_IDS python3 train_hyperbolic.py $COMMON_ARGS
