@@ -143,5 +143,6 @@ output/
 checkpoint/
 data/
 logs/
+wandb/
 
 .idea
