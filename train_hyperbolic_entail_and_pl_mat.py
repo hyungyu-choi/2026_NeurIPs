@@ -144,18 +144,33 @@ class LearnableScaleWeights(nn.Module):
     The temperature controls how peaked the distribution is:
       - High temp -> near-uniform weights
       - Low temp  -> winner-take-all
+
+    A minimum weight (min_weight) is enforced per scale to prevent
+    "scale collapse", where a scale's weight converges to ~0 and its
+    gradient signal vanishes irreversibly. The final weights are computed as:
+        w = (1 - n_scales * min_weight) * softmax(logits / temp) + min_weight
+    This guarantees each weight >= min_weight while keeping sum = 1.
     """
 
-    def __init__(self, n_scales: int = 3, init_temp: float = 1.0):
+    def __init__(self, n_scales: int = 3, init_temp: float = 1.0,
+                 min_weight: float = 0.01):
         super().__init__()
+        assert 0.0 <= min_weight < 1.0 / n_scales, \
+            f"min_weight must be in [0, 1/n_scales), got {min_weight}"
         # Initialize logits to 0 -> equal weights after softmax
         self.logits = nn.Parameter(torch.zeros(n_scales))
         self.log_temp = nn.Parameter(torch.tensor(init_temp).log())
+        self.n_scales = n_scales
+        self.min_weight = min_weight
 
     def forward(self) -> torch.Tensor:
-        """Returns (n_scales,) tensor of positive weights summing to 1."""
+        """Returns (n_scales,) tensor of positive weights summing to 1,
+        each guaranteed >= min_weight."""
         temp = self.log_temp.exp().clamp(min=0.01, max=10.0)
-        return F.softmax(self.logits / temp, dim=0)
+        soft_w = F.softmax(self.logits / temp, dim=0)
+        # Convex combination: ensures each weight >= min_weight, sum = 1
+        w = (1.0 - self.n_scales * self.min_weight) * soft_w + self.min_weight
+        return w
 
     @property
     def temperature(self) -> torch.Tensor:
@@ -196,6 +211,7 @@ class MultiScaleHyperbolicCombinedModel(nn.Module):
         score_dropout: float = 0.1,
         # Scale weight
         scale_weight_temp: float = 1.0,
+        scale_min_weight: float = 0.01,
         zero_head: bool = True,
         vis: bool = False,
     ):
@@ -264,6 +280,7 @@ class MultiScaleHyperbolicCombinedModel(nn.Module):
         # -- Learnable scale weights --
         self.scale_weights = LearnableScaleWeights(
             n_scales=3, init_temp=scale_weight_temp,
+            min_weight=scale_min_weight,
         )
 
         self.embed_dim = embed_dim
@@ -412,6 +429,7 @@ def setup(args):
         score_mlp_ratio=args.score_mlp_ratio,
         score_dropout=args.score_dropout,
         scale_weight_temp=args.scale_weight_temp,
+        scale_min_weight=args.scale_min_weight,
         zero_head=True,
     )
     model.to(args.device)
@@ -424,7 +442,8 @@ def setup(args):
                 f"half={args.embed_dim // 2}, quarter={args.embed_dim // 4}")
     logger.info(f"Pre-split LorentzBlocks: {args.pre_split_n_layers} layers, "
                 f"{args.pre_split_n_heads} heads")
-    logger.info(f"Scale weights: LEARNABLE (init_temp={args.scale_weight_temp})")
+    logger.info(f"Scale weights: LEARNABLE (init_temp={args.scale_weight_temp}, "
+                f"min_weight={args.scale_min_weight})")
     return args, model
 
 
@@ -612,7 +631,8 @@ def train(args, model):
     logger.info(f"  Score head layers          = {args.score_n_layers}")
     logger.info(f"  Loss weights: cone={args.cone_weight}, "
                 f"height={args.height_weight}, pl={args.pl_weight}")
-    logger.info(f"  Scale weights: LEARNABLE (softmax, temp_init={args.scale_weight_temp})")
+    logger.info(f"  Scale weights: LEARNABLE (softmax, temp_init={args.scale_weight_temp}, "
+                f"min_weight={args.scale_min_weight})")
 
     model.zero_grad()
     set_seed(args)
@@ -852,6 +872,9 @@ def main():
     parser.add_argument("--scale_weight_temp", default=1.0, type=float,
                         help="Initial temperature for scale weight softmax. "
                              "Higher = more uniform initial weights.")
+    parser.add_argument("--scale_min_weight", default=0.01, type=float,
+                        help="Minimum weight per scale to prevent scale collapse. "
+                             "Must be in [0, 1/n_scales). Default 0.01.")
 
     # Per-scale Lorentz Score Head
     parser.add_argument("--score_n_layers", default=2, type=int)

@@ -1,9 +1,13 @@
 #!/bin/bash
 
 # ========================
-# Multi-Scale Hyperbolic Entailment + Plackett-Luce (MAT v2) Training
+# Hyperbolic PL-Only Training
 # ========================
-NAME="cholec80-hyperbolic-entail-pl-mat"
+# Architecture:
+#   ViT → MERUStyleProjection (hyperboloid, dim D) → LorentzScoreHead → PL scores
+#   Loss: Plackett-Luce only (no entailment, no multi-scale)
+# ========================
+NAME="cholec80-hyperbolic-pl-only"
 MODEL_TYPE="ViT-B_16"
 # PRETRAINED_DIR="checkpoint/ViT-B_16.npz"
 OUTPUT_DIR="output"
@@ -24,29 +28,12 @@ EMBED_DIM=128
 CURV_INIT=1.0
 LEARN_CURV="--learn_curv"
 
-# Pre-split Lorentz interaction
-PRE_SPLIT_N_LAYERS=2
-PRE_SPLIT_N_HEADS=4
-PRE_SPLIT_MLP_RATIO=4.0
-PRE_SPLIT_DROPOUT=0.1
-
-# Entailment loss
-MIN_RADIUS=0.1
-HEIGHT_MARGIN=0.1
-HEIGHT_WEIGHT=1.0
-CONE_WEIGHT=1.0
-
 # Plackett-Luce loss
-PL_WEIGHT=1.0
-PL_SAMPLE=""
+PL_SAMPLE=""                # "--pl_sample" 으로 설정하면 subset sampling 사용
 PL_R=4
 PL_K=8
 
-# Learnable scale weights
-SCALE_WEIGHT_TEMP=1.0
-SCALE_MIN_WEIGHT=0.01      # 각 스케일의 최소 가중치 (scale collapse 방지)
-
-# Per-scale Lorentz Score Head
+# Lorentz Score Head
 SCORE_N_LAYERS=2
 SCORE_N_HEADS=4
 SCORE_MLP_RATIO=4.0
@@ -65,7 +52,7 @@ WARMUP_STEPS=1000
 MAX_GRAD_NORM=1.0
 SEED=42
 GRADIENT_ACCUMULATION_STEPS=1
-FP16=""
+FP16=""                     # "--fp16" 으로 설정하면 mixed precision 사용
 
 # Wandb
 USE_WANDB="--use_wandb"
@@ -73,7 +60,7 @@ WANDB_PROJECT="hyperbolic-temporal-vit"
 # WANDB_ENTITY=""
 
 # GPU
-GPU_IDS="2"
+GPU_IDS="3"
 MODE="single"
 
 # ========================
@@ -91,19 +78,8 @@ COMMON_ARGS="
     --sampling_mode $SAMPLING_MODE \
     --embed_dim $EMBED_DIM \
     --curv_init $CURV_INIT \
-    --pre_split_n_layers $PRE_SPLIT_N_LAYERS \
-    --pre_split_n_heads $PRE_SPLIT_N_HEADS \
-    --pre_split_mlp_ratio $PRE_SPLIT_MLP_RATIO \
-    --pre_split_dropout $PRE_SPLIT_DROPOUT \
-    --min_radius $MIN_RADIUS \
-    --height_margin $HEIGHT_MARGIN \
-    --height_weight $HEIGHT_WEIGHT \
-    --cone_weight $CONE_WEIGHT \
-    --pl_weight $PL_WEIGHT \
     --pl_R $PL_R \
     --pl_K $PL_K \
-    --scale_weight_temp $SCALE_WEIGHT_TEMP \
-    --scale_min_weight $SCALE_MIN_WEIGHT \
     --score_n_layers $SCORE_N_LAYERS \
     --score_n_heads $SCORE_N_HEADS \
     --score_mlp_ratio $SCORE_MLP_RATIO \
@@ -132,26 +108,25 @@ COMMON_ARGS="
 
 if [ "$MODE" = "single" ]; then
     echo "=============================="
-    echo "Multi-Scale Hyperbolic + PL (MAT v2) training"
-    echo "GPU: $GPU_IDS"
-    echo "Loss: Entailment(cone=$CONE_WEIGHT, height=$HEIGHT_WEIGHT) + PL($PL_WEIGHT)"
-    echo "Embed dim: $EMBED_DIM (scales: D, D/2, D/4)"
-    echo "Pre-split LorentzBlocks: layers=$PRE_SPLIT_N_LAYERS, heads=$PRE_SPLIT_N_HEADS"
-    echo "Scale weights: LEARNABLE (temp_init=$SCALE_WEIGHT_TEMP, min_weight=$SCALE_MIN_WEIGHT)"
+    echo "Hyperbolic PL-Only 학습 시작"
+    echo "사용 GPU: $GPU_IDS"
+    echo "Loss: Plackett-Luce only (no entailment)"
+    echo "Embed dim: $EMBED_DIM"
     echo "Score Head: layers=$SCORE_N_LAYERS, heads=$SCORE_N_HEADS"
     echo "=============================="
-    CUDA_VISIBLE_DEVICES=$GPU_IDS python3 train_hyperbolic_entail_and_pl_mat.py $COMMON_ARGS
+    CUDA_VISIBLE_DEVICES=$GPU_IDS python3 train_hyperbolic_pl_only.py $COMMON_ARGS
 
 elif [ "$MODE" = "multi" ]; then
     echo "=============================="
-    echo "Multi-GPU training"
-    echo "GPU: $GPU_IDS, Num GPUs: $NUM_GPUS"
+    echo "분산 학습 (Multi-GPU) 시작"
+    echo "사용 GPU: $GPU_IDS"
+    echo "GPU 수: $NUM_GPUS"
     echo "=============================="
     CUDA_VISIBLE_DEVICES=$GPU_IDS torchrun \
         --nproc_per_node=$NUM_GPUS \
-        train_hyperbolic_entail_and_pl_mat.py $COMMON_ARGS
+        train_hyperbolic_pl_only.py $COMMON_ARGS
 
 else
-    echo "Set MODE to 'single' or 'multi'."
+    echo "MODE를 'single' 또는 'multi'로 설정해주세요."
     exit 1
 fi
