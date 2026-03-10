@@ -331,6 +331,17 @@ class ViTFeatureExtractor(nn.Module):
             )
             self._get_backbone = lambda: self.model.encoder.backbone
 
+        elif model_variant == "hyperbolic_pl":
+            from train_hyperbolic_pl_only import HyperbolicPLModel
+            self.model = HyperbolicPLModel(
+                config, img_size=img_size, embed_dim=embed_dim,
+                curv_init=curv_init, learn_curv=learn_curv,
+                score_n_layers=score_n_layers, score_n_heads=score_n_heads,
+                score_mlp_ratio=score_mlp_ratio, score_dropout=score_dropout,
+                zero_head=True,
+            )
+            self._get_backbone = lambda: self.model.encoder.backbone
+
         elif model_variant == "backbone_only":
             self.model = VisionTransformer(
                 config, img_size=img_size, num_classes=1, zero_head=True,
@@ -464,8 +475,8 @@ def main():
                         choices=["ViT-B_16", "ViT-B_32", "ViT-L_16",
                                  "ViT-L_32", "ViT-H_14", "R50-ViT-B_16"])
     parser.add_argument("--model_variant", type=str, default="hyperbolic",
-                        choices=["euclidean", "hyperbolic", "combined", "mat",
-                                 "backbone_only"],
+                        choices=["euclidean", "hyperbolic", "combined",
+                                 "hyperbolic_pl", "mat", "backbone_only"],
                         help="Which model architecture was used for training.")
     parser.add_argument("--img_size", type=int, default=224)
 

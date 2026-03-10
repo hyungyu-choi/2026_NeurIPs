@@ -8,11 +8,11 @@
 # ========================
 
 # ─── Checkpoint ───
-CHECKPOINT="output/cholec80-hyperbolic-entail-pl-mat/cholec80-hyperbolic-entail-pl-mat_step10000_checkpoint.bin"
+CHECKPOINT="output/cholec80-hyperbolic-pl-only/cholec80-hyperbolic-pl-only_step10000_checkpoint.bin"
 MODEL_TYPE="ViT-B_16"
 
-# Model variant: "euclidean" | "hyperbolic" | "combined" | "mat" | "backbone_only"
-MODEL_VARIANT="mat"
+# Model variant: "euclidean" | "hyperbolic" | "combined" | "hyperbolic_pl" | "mat" | "backbone_only"
+MODEL_VARIANT="hyperbolic_pl"
 
 # ─── Dataset paths ───
 TRAIN_ROOT="../code/Dataset/cholec80/frames/extract_1fps/training_set"
