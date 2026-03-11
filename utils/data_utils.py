@@ -13,17 +13,51 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 
-class Cholec80TemporalDataset(Dataset):
+# ═════════════════════════════════════════════
+# Dataset Configurations
+# ═════════════════════════════════════════════
+
+DATASET_CONFIGS = {
+    "cholec80": {
+        "train_root": "../code/Dataset/cholec80/frames/extract_1fps/training_set",
+        "val_root": None,  # "../code/Dataset/cholec80/frames/extract_1fps/val_set"
+        "description": "Cholec80 surgical video dataset (1fps frames)",
+    },
+    "lemon": {
+        "train_root": "../Dataset/LEMON_frames",
+        "val_root": None,
+        "description": "LEMON video dataset (1fps frames, folders 0000~xxxx)",
+    },
+}
+
+
+def get_dataset_config(dataset_name: str) -> dict:
+    """Get default configuration for a named dataset."""
+    name = dataset_name.lower()
+    if name not in DATASET_CONFIGS:
+        available = ", ".join(DATASET_CONFIGS.keys())
+        raise ValueError(
+            f"Unknown dataset '{dataset_name}'. Available: {available}"
+        )
+    return DATASET_CONFIGS[name]
+
+
+def list_datasets() -> List[str]:
+    """Return list of supported dataset names."""
+    return list(DATASET_CONFIGS.keys())
+
+
+class TemporalVideoDataset(Dataset):
     """
-    Temporal dataset for cholec80 frames stored in per-video folders.
+    Generic temporal dataset for video frames stored in per-video folders.
 
     Directory structure:
         root/
-            01/  (or video01, etc.)
+            video_folder_1/  (any naming: 01, video01, 0000, etc.)
                 000000.jpg
                 000001.jpg
                 ...
-            02/
+            video_folder_2/
                 ...
 
     Sampling modes:
@@ -83,7 +117,7 @@ class Cholec80TemporalDataset(Dataset):
         # --- Build initial samples ---
         self._build_samples(seed=0)
         logger.info(
-            f"[Cholec80TemporalDataset] mode='{self.sampling_mode}', "
+            f"[TemporalVideoDataset] mode='{self.sampling_mode}', "
             f"seq_len={self.seq_len}, videos={len(self.vid2frames)}, "
             f"total_samples={len(self.samples)}"
         )
@@ -186,7 +220,11 @@ class Cholec80TemporalDataset(Dataset):
         return torch.stack(frames, 0)  # [seq_len, 3, H, W]
 
 
-class Cholec80ValDataset(Dataset):
+# Backward-compatible alias
+Cholec80TemporalDataset = TemporalVideoDataset
+
+
+class TemporalValDataset(Dataset):
     """
     Validation dataset: uniformly samples seq_len frames from each video (deterministic).
     One sample per video.
@@ -247,12 +285,20 @@ class Cholec80ValDataset(Dataset):
         return torch.stack(frames, 0)
 
 
+# Backward-compatible alias
+Cholec80ValDataset = TemporalValDataset
+
+
 def get_loader(args):
     """
-    Build train/test data loaders for cholec80 temporal dataset.
+    Build train/test data loaders for temporal video dataset.
+
+    Supports dataset selection via args.dataset (default: 'cholec80').
+    If args.data_root is explicitly provided, it overrides the dataset default.
 
     Expected args attributes:
-        args.data_root       : path to training video folders
+        args.dataset         : dataset name ('cholec80', 'lemon', etc.)
+        args.data_root       : path to training video folders (overrides dataset default)
         args.val_root        : path to validation video folders (optional, can be None)
         args.img_size        : image resolution (default 224)
         args.seq_len         : number of frames per clip
@@ -266,16 +312,25 @@ def get_loader(args):
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()
 
+    # --- Resolve dataset paths ---
+    dataset_name = getattr(args, 'dataset', 'cholec80')
+    ds_config = get_dataset_config(dataset_name)
+
+    # Use explicit args if provided, otherwise fall back to dataset defaults
+    data_root = getattr(args, 'data_root', None) or ds_config['train_root']
+    val_root = getattr(args, 'val_root', None) or ds_config.get('val_root', None)
+
+    logger.info(f"Dataset: {dataset_name} ({ds_config['description']})")
+    logger.info(f"  train_root: {data_root}")
+    logger.info(f"  val_root:   {val_root}")
+
     # --- Defaults for optional attributes ---
     seq_len = getattr(args, 'seq_len', 8)
     min_step = getattr(args, 'min_step', 1)
     max_step = getattr(args, 'max_step', 20)
     sampling_mode = getattr(args, 'sampling_mode', 'randstep')
-    data_root = getattr(args, 'data_root',
-                        '../code/Dataset/cholec80/frames/extract_1fps/training_set')
-    val_root = getattr(args, 'val_root', None)
 
-    trainset = Cholec80TemporalDataset(
+    trainset = TemporalVideoDataset(
         root=data_root,
         img_size=args.img_size,
         seq_len=seq_len,
@@ -286,7 +341,7 @@ def get_loader(args):
 
     testset = None
     if val_root is not None and args.local_rank in [-1, 0]:
-        testset = Cholec80ValDataset(
+        testset = TemporalValDataset(
             root=val_root,
             img_size=args.img_size,
             seq_len=seq_len,

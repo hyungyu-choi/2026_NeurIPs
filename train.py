@@ -313,9 +313,11 @@ def main():
     parser.add_argument("--output_dir", default="output", type=str)
 
     # Dataset
-    parser.add_argument("--data_root", type=str,
-                        default="../code/Dataset/cholec80/frames/extract_1fps/training_set",
-                        help="Path to training video folders.")
+    parser.add_argument("--dataset", type=str, default="cholec80",
+                        choices=["cholec80", "lemon"],
+                        help="Dataset to use for training (default: cholec80).")
+    parser.add_argument("--data_root", type=str, default=None,
+                        help="Training data root. If None, uses default for --dataset.")
     parser.add_argument("--val_root", type=str, default=None,
                         help="Path to validation video folders (optional).")
     parser.add_argument("--img_size", default=224, type=int)
