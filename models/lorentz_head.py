@@ -53,6 +53,12 @@ import torch.nn as nn
 from models import lorentz_ops as L
 
 
+# Default max norm for space components in LorentzBlock feedback loop.
+# Normal operating range is 0.1–1.0; this is a generous safety ceiling
+# that prevents catastrophic cancellation in Lorentzian inner products.
+_BLOCK_MAX_NORM = 30.0
+
+
 # ═════════════════════════════════════════════
 # Building blocks
 # ═════════════════════════════════════════════
@@ -106,6 +112,10 @@ class LorentzAttention(nn.Module):
         q_hyp = L.exp_map0(q_tan.reshape(-1, hd), curv).view(B, self.n_heads, T, hd)
         k_hyp = L.exp_map0(k_tan.reshape(-1, hd), curv).view(B, self.n_heads, T, hd)
 
+        # Clamp per-head norms to prevent catastrophic cancellation
+        q_hyp = L.clamp_norm(q_hyp, max_norm=_BLOCK_MAX_NORM)
+        k_hyp = L.clamp_norm(k_hyp, max_norm=_BLOCK_MAX_NORM)
+
         # time components  (B, nH, T, 1)
         q_time = torch.sqrt(1.0 / curv + (q_hyp ** 2).sum(-1, keepdim=True))
         k_time = torch.sqrt(1.0 / curv + (k_hyp ** 2).sum(-1, keepdim=True))
@@ -152,15 +162,21 @@ class LorentzBlock(nn.Module):
 
     Input/output live on the hyperboloid (space components only).
     Internally uses log/exp maps to bridge tangent ↔ manifold.
+
+    After each exp_map0, space-component norms are clamped to prevent
+    the feedback loop: large norm → catastrophic cancellation in
+    Lorentzian inner product → garbage attention → norm explosion → NaN.
     """
 
     def __init__(self, embed_dim: int, n_heads: int,
-                 mlp_ratio: float = 4.0, dropout: float = 0.1):
+                 mlp_ratio: float = 4.0, dropout: float = 0.1,
+                 max_norm: float = _BLOCK_MAX_NORM):
         super().__init__()
         self.norm1 = nn.LayerNorm(embed_dim)
         self.attn  = LorentzAttention(embed_dim, n_heads, dropout)
         self.norm2 = nn.LayerNorm(embed_dim)
         self.mlp   = LorentzMLP(embed_dim, mlp_ratio, dropout)
+        self.max_norm = max_norm
 
     def forward(self, h: torch.Tensor, curv: torch.Tensor) -> torch.Tensor:
         """
@@ -181,6 +197,7 @@ class LorentzBlock(nn.Module):
         # Residual in tangent space → retract to hyperboloid
         h_new_tan = h_tan + attn_delta
         h = L.exp_map0(h_new_tan.reshape(B * T, D), curv).reshape(B, T, D)
+        h = L.clamp_norm(h, max_norm=self.max_norm)  # ← prevent norm explosion
 
         # ── MLP sub-block ──
         h_tan = L.log_map0(h.reshape(B * T, D), curv).reshape(B, T, D)
@@ -190,6 +207,7 @@ class LorentzBlock(nn.Module):
 
         h_new_tan = h_tan + mlp_delta
         h = L.exp_map0(h_new_tan.reshape(B * T, D), curv).reshape(B, T, D)
+        h = L.clamp_norm(h, max_norm=self.max_norm)  # ← prevent norm explosion
 
         return h
 

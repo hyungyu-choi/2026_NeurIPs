@@ -8,11 +8,11 @@
 # ========================
 
 # ─── Checkpoint ───
-CHECKPOINT="output/cholec80-hyperbolic-pl-only/cholec80-hyperbolic-pl-only_step10000_checkpoint.bin"
+CHECKPOINT="output/lemon-mat-angular/lemon-mat-angular_step45000_checkpoint.bin"
 MODEL_TYPE="ViT-B_16"
 
 # Model variant: "euclidean" | "hyperbolic" | "combined" | "hyperbolic_pl" | "mat" | "backbone_only"
-MODEL_VARIANT="hyperbolic_pl"
+MODEL_VARIANT="mat"
 
 # ─── Dataset paths ───
 TRAIN_ROOT="../code/Dataset/cholec80/frames/extract_1fps/training_set"
@@ -52,7 +52,7 @@ NUM_WORKERS=4
 OUTPUT_FILE="output/eval_results/knn_k${K}_${MODEL_VARIANT}.txt"
 
 # ─── GPU ───
-GPU_ID="2"
+GPU_ID="3"
 
 # ========================
 # 실행

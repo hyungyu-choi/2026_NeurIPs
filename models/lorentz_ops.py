@@ -17,6 +17,34 @@ import torch
 from torch import Tensor
 
 
+# ── Safety: max space-component norm after exp_map ──
+# sinh(asinh(100)) = 100 → space norms capped at ~100 globally.
+# This prevents catastrophic cancellation in Lorentzian inner products
+# where float32 precision breaks down for large norms.
+_EXP_MAP_MAX = math.asinh(100.0)   # ≈ 5.30  (was asinh(2**15) ≈ 11.09)
+
+
+def clamp_norm(
+    x: Tensor, max_norm: float = 50.0, eps: float = 1e-8
+) -> Tensor:
+    """
+    Clamp the L2 norm of space components to max_norm.
+
+    If ||x|| > max_norm, rescale x so that ||x|| = max_norm.
+    This keeps embeddings on the hyperboloid but closer to the origin,
+    preventing numerical instability in downstream Lorentzian operations.
+
+    Args:
+        x: (..., D) space components
+        max_norm: maximum allowed L2 norm
+    Returns:
+        (..., D) norm-clamped space components (still on hyperboloid)
+    """
+    norms = torch.norm(x, dim=-1, keepdim=True)
+    scale = torch.clamp(max_norm / (norms + eps), max=1.0)
+    return x * scale
+
+
 def pairwise_inner(x: Tensor, y: Tensor, curv: float | Tensor = 1.0) -> Tensor:
     """
     Pairwise Lorentzian inner product.
@@ -76,7 +104,7 @@ def exp_map0(x: Tensor, curv: float | Tensor = 1.0, eps: float = 1e-8) -> Tensor
         (B, D) space components on the hyperboloid
     """
     rc_xnorm = curv ** 0.5 * torch.norm(x, dim=-1, keepdim=True)
-    sinh_input = torch.clamp(rc_xnorm, min=eps, max=math.asinh(2 ** 15))
+    sinh_input = torch.clamp(rc_xnorm, min=eps, max=_EXP_MAP_MAX)
     _output = torch.sinh(sinh_input) * x / torch.clamp(rc_xnorm, min=eps)
     return _output
 

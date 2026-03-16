@@ -1,18 +1,27 @@
 #!/bin/bash
 
 # ========================
-# Multi-Scale Hyperbolic Entailment + Plackett-Luce (MAT v2) Training
+# Multi-Scale Hyperbolic MAT + Angular Contrastive SSL Training
 # ── LEMON Dataset ──
 # ========================
-NAME="lemon-hyperbolic-entail-pl-mat-fulldataset_nonlearnable_hyperparameter_copy"
+#
+# This extends the MAT architecture with angular contrastive learning:
+#   - Radial branch: Entailment + PL loss (temporal ordering)
+#   - Angular branch: InfoNCE contrastive loss (visual content)
+#
+# The two branches constrain orthogonal components of the Lorentz embedding:
+#   radial = ||h_space||  → temporal position
+#   angular = h_space/||h|| → visual content
+# ========================
+
+NAME="lemon-mat-angular"
 MODEL_TYPE="ViT-B_16"
 # PRETRAINED_DIR="checkpoint/ViT-B_16.npz"
 OUTPUT_DIR="output"
 
 # ─── Dataset ───
 DATASET="lemon"
-# DATA_ROOT는 비워두면 DATASET_CONFIGS에서 기본값 사용 (../Dataset/LEMON_frames)
-# DATA_ROOT="../Dataset/LEMON_frames"
+# DATA_ROOT=""   # 비워두면 DATASET_CONFIGS 기본값 사용
 
 # Temporal sampling
 IMG_SIZE=224
@@ -21,22 +30,10 @@ MIN_STEP=1
 MAX_STEP=20
 SAMPLING_MODE="global"
 
-# ─── Hyperbolic space (MERU-style) ───
+# Hyperbolic space (MERU-style)
 EMBED_DIM=128
 CURV_INIT=1.0
-# Curvature: FIXED (not learned)
-NO_LEARN_CURV="--no_learn_curv"
-
-# ─── Alpha scaling: FIXED ───
-# embed_dim^{-0.5} = 128^{-0.5} ≈ 0.0884
-# 이 값은 임베딩을 hyperboloid에 적절한 스케일로 투영하는 기본 초기값
-NO_LEARN_ALPHA="--no_learn_alpha"
-ALPHA_INIT=0.0884
-
-# ─── Scale weights: FIXED (equal) ───
-# full(D=128), half(D=64), quarter(D=32) 세 스케일에 균등 가중치
-# 특정 스케일이 더 중요한지 사전 정보가 없으므로 균등 배분이 안전
-FIXED_SCALE_WEIGHTS="0.34 0.33 0.33"
+LEARN_CURV="--learn_curv"
 
 # Pre-split Lorentz interaction
 PRE_SPLIT_N_LAYERS=2
@@ -56,28 +53,32 @@ PL_SAMPLE=""
 PL_R=4
 PL_K=8
 
+# Learnable scale weights
+SCALE_WEIGHT_TEMP=1.0
+SCALE_MIN_WEIGHT=0.01
+
 # Per-scale Lorentz Score Head
 SCORE_N_LAYERS=2
 SCORE_N_HEADS=4
 SCORE_MLP_RATIO=4.0
 SCORE_DROPOUT=0.1
 
-# ─── Training hyperparameters ───
-# 데이터셋: ~805K samples, batch=32, ~25,170 steps/epoch
-# 30 epoch = 25,170 × 30 ≈ 750,000 steps
-#   - LR 5e-5: 30 epoch 충분한 반복이므로 낮은 LR로 안정적 수렴
-#   - Weight decay 0.05: epoch 많을수록 regularization 강화하여 overfitting 방지
-#   - Warmup 10,000: 전체의 ~1.3%, hyperbolic geometry 안정화에 충분
-#   - Eval every 5,000: 전체 스텝 대비 적절한 빈도 (~0.2 epoch마다)
+# ─── Angular Contrastive (NEW) ───
+CONTRAST_K=2                # T개 프레임 중 K개를 contrastive pair로 사용
+ANGULAR_WEIGHT=0.5          # Angular loss 가중치 (λ_ang)
+ANGULAR_TEMPERATURE=0.1     # InfoNCE temperature (τ)
+ANGULAR_PROJ_DIM=128        # Angular projection head 출력 차원
+
+# Training
 TRAIN_BATCH_SIZE=32
 EVAL_BATCH_SIZE=16
 EVAL_EVERY=5000
 
-LEARNING_RATE=5e-5
+LEARNING_RATE=1e-4
 WEIGHT_DECAY=0.05
 NUM_STEPS=750000
 DECAY_TYPE="cosine"
-WARMUP_STEPS=10000
+WARMUP_STEPS=1000
 MAX_GRAD_NORM=1.0
 SEED=42
 GRADIENT_ACCUMULATION_STEPS=1
@@ -89,7 +90,7 @@ WANDB_PROJECT="hyperbolic-temporal-vit"
 # WANDB_ENTITY=""
 
 # GPU
-GPU_IDS="0"
+GPU_IDS="2"
 MODE="single"
 
 # ========================
@@ -107,7 +108,6 @@ COMMON_ARGS="
     --sampling_mode $SAMPLING_MODE \
     --embed_dim $EMBED_DIM \
     --curv_init $CURV_INIT \
-    --alpha_init $ALPHA_INIT \
     --pre_split_n_layers $PRE_SPLIT_N_LAYERS \
     --pre_split_n_heads $PRE_SPLIT_N_HEADS \
     --pre_split_mlp_ratio $PRE_SPLIT_MLP_RATIO \
@@ -119,10 +119,16 @@ COMMON_ARGS="
     --pl_weight $PL_WEIGHT \
     --pl_R $PL_R \
     --pl_K $PL_K \
+    --scale_weight_temp $SCALE_WEIGHT_TEMP \
+    --scale_min_weight $SCALE_MIN_WEIGHT \
     --score_n_layers $SCORE_N_LAYERS \
     --score_n_heads $SCORE_N_HEADS \
     --score_mlp_ratio $SCORE_MLP_RATIO \
     --score_dropout $SCORE_DROPOUT \
+    --contrast_k $CONTRAST_K \
+    --angular_weight $ANGULAR_WEIGHT \
+    --angular_temperature $ANGULAR_TEMPERATURE \
+    --angular_proj_dim $ANGULAR_PROJ_DIM \
     --train_batch_size $TRAIN_BATCH_SIZE \
     --eval_batch_size $EVAL_BATCH_SIZE \
     --eval_every $EVAL_EVERY \
@@ -136,15 +142,11 @@ COMMON_ARGS="
     --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS
 "
 
-# Fixed hyperparameters
-[ ! -z "$NO_LEARN_CURV" ]      && COMMON_ARGS="$COMMON_ARGS $NO_LEARN_CURV"
-[ ! -z "$NO_LEARN_ALPHA" ]     && COMMON_ARGS="$COMMON_ARGS $NO_LEARN_ALPHA"
-[ ! -z "$FIXED_SCALE_WEIGHTS" ] && COMMON_ARGS="$COMMON_ARGS --fixed_scale_weights $FIXED_SCALE_WEIGHTS"
-
 # Optional flags
 [ ! -z "$PRETRAINED_DIR" ] && COMMON_ARGS="$COMMON_ARGS --pretrained_dir $PRETRAINED_DIR"
 [ ! -z "$DATA_ROOT" ]      && COMMON_ARGS="$COMMON_ARGS --data_root $DATA_ROOT"
 [ ! -z "$VAL_ROOT" ]       && COMMON_ARGS="$COMMON_ARGS --val_root $VAL_ROOT"
+[ ! -z "$LEARN_CURV" ]     && COMMON_ARGS="$COMMON_ARGS $LEARN_CURV"
 [ ! -z "$PL_SAMPLE" ]      && COMMON_ARGS="$COMMON_ARGS $PL_SAMPLE"
 [ ! -z "$FP16" ]            && COMMON_ARGS="$COMMON_ARGS $FP16"
 [ ! -z "$USE_WANDB" ]      && COMMON_ARGS="$COMMON_ARGS $USE_WANDB --wandb_project $WANDB_PROJECT"
@@ -152,18 +154,23 @@ COMMON_ARGS="
 
 if [ "$MODE" = "single" ]; then
     echo "=============================="
-    echo "Multi-Scale Hyperbolic + PL (MAT v2) training"
+    echo "Multi-Scale MAT + Angular Contrastive training"
     echo "Dataset: $DATASET"
     echo "GPU: $GPU_IDS"
-    echo "Loss: Entailment(cone=$CONE_WEIGHT, height=$HEIGHT_WEIGHT) + PL($PL_WEIGHT)"
-    echo "Embed dim: $EMBED_DIM (scales: D, D/2, D/4)"
-    echo "Curvature: FIXED ($CURV_INIT)"
-    echo "Alpha: FIXED ($ALPHA_INIT)"
-    echo "Scale weights: FIXED ($FIXED_SCALE_WEIGHTS)"
-    echo "LR: $LEARNING_RATE, WD: $WEIGHT_DECAY, Decay: $DECAY_TYPE"
-    echo "Warmup: $WARMUP_STEPS steps"
+    echo "────────────────────────"
+    echo "Radial branch:"
+    echo "  Entailment(cone=$CONE_WEIGHT, height=$HEIGHT_WEIGHT) + PL($PL_WEIGHT)"
+    echo "  Embed dim: $EMBED_DIM (scales: D, D/2, D/4)"
+    echo "  Pre-split LorentzBlocks: layers=$PRE_SPLIT_N_LAYERS"
+    echo "  Scale weights: LEARNABLE"
+    echo "────────────────────────"
+    echo "Angular branch:"
+    echo "  Contrast K: $CONTRAST_K frames/clip"
+    echo "  Angular weight λ: $ANGULAR_WEIGHT"
+    echo "  Temperature τ: $ANGULAR_TEMPERATURE"
+    echo "  Proj dim: $ANGULAR_PROJ_DIM"
     echo "=============================="
-    CUDA_VISIBLE_DEVICES=$GPU_IDS python3 train_hyperbolic_entail_and_pl_mat.py $COMMON_ARGS
+    CUDA_VISIBLE_DEVICES=$GPU_IDS python3 train_hyperbolic_entail_and_pl_mat_angular.py $COMMON_ARGS
 
 elif [ "$MODE" = "multi" ]; then
     echo "=============================="
@@ -173,7 +180,7 @@ elif [ "$MODE" = "multi" ]; then
     echo "=============================="
     CUDA_VISIBLE_DEVICES=$GPU_IDS torchrun \
         --nproc_per_node=$NUM_GPUS \
-        train_hyperbolic_entail_and_pl_mat.py $COMMON_ARGS
+        train_hyperbolic_entail_and_pl_mat_angular.py $COMMON_ARGS
 
 else
     echo "Set MODE to 'single' or 'multi'."

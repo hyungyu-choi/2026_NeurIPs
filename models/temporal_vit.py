@@ -123,13 +123,14 @@ class MERUStyleProjection(nn.Module):
 
     Following MERU:
       - Linear projection to embed_dim
-      - Learnable alpha scaling (clamped to not upscale)
+      - Learnable (or fixed) alpha scaling (clamped to not upscale)
       - Exponential map at origin to lift onto hyperboloid
       - Only space components are output (time computed on-the-fly)
     """
 
     def __init__(self, in_dim: int, embed_dim: int, curv_init: float = 1.0,
-                 learn_curv: bool = True):
+                 learn_curv: bool = True, learn_alpha: bool = True,
+                 alpha_init: float = None):
         super().__init__()
         self.proj = nn.Linear(in_dim, embed_dim)
 
@@ -142,8 +143,17 @@ class MERUStyleProjection(nn.Module):
             "min": math.log(curv_init / 10),
         }
 
-        # Learnable scaling factor (initialized so features have ~unit norm)
-        self.alpha = nn.Parameter(torch.tensor(embed_dim ** -0.5).log())
+        # Alpha scaling factor
+        if alpha_init is None:
+            alpha_init = embed_dim ** -0.5
+
+        _alpha_log = torch.tensor(alpha_init).log()
+        if learn_alpha:
+            self.alpha = nn.Parameter(_alpha_log)
+        else:
+            self.register_buffer('alpha', _alpha_log)
+
+        self._learn_alpha = learn_alpha
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -154,8 +164,9 @@ class MERUStyleProjection(nn.Module):
         """
         # Clamp curvature
         self.curv.data = torch.clamp(self.curv.data, **self._curv_minmax)
-        # Clamp alpha so it doesn't upscale
-        self.alpha.data = torch.clamp(self.alpha.data, max=0.0)
+        # Clamp alpha so it doesn't upscale (only if learnable)
+        if self._learn_alpha:
+            self.alpha.data = torch.clamp(self.alpha.data, max=0.0)
 
         v = self.proj(x)                          # (..., embed_dim)
         v = v * self.alpha.exp()                   # scale
@@ -166,6 +177,8 @@ class MERUStyleProjection(nn.Module):
                 h = L.exp_map0(v.float(), self.curv.exp())
         else:
             h = L.exp_map0(v.float(), self.curv.exp())
+
+        h = L.clamp_norm(h, max_norm=30.0)  # prevent norm explosion
 
         return h
 
@@ -308,7 +321,9 @@ class HyperbolicTemporalViT(nn.Module):
 
     def __init__(self, config, img_size=224, pretrained_weights=None,
                  embed_dim: int = 128, curv_init: float = 1.0,
-                 learn_curv: bool = True, zero_head=True, vis=False):
+                 learn_curv: bool = True, learn_alpha: bool = True,
+                 alpha_init: float = None,
+                 zero_head=True, vis=False):
         super().__init__()
         self.backbone = VisionTransformer(
             config, img_size=img_size, num_classes=1,
@@ -319,6 +334,8 @@ class HyperbolicTemporalViT(nn.Module):
             embed_dim=embed_dim,
             curv_init=curv_init,
             learn_curv=learn_curv,
+            learn_alpha=learn_alpha,
+            alpha_init=alpha_init,
         )
         if pretrained_weights is not None:
             self.backbone.load_from(pretrained_weights)

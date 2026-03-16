@@ -1,24 +1,35 @@
 # coding=utf-8
 """
 Train ViT with combined MERU-style hyperbolic entailment loss + Plackett-Luce
-temporal ordering loss at MULTIPLE SCALES (MAT = Multi-scale Attention on Tangent).
+temporal ordering loss at MULTIPLE SCALES (MAT) + Angular Contrastive SSL.
 
-Architecture (v2 - with pre-split Lorentz interaction):
+This extends train_hyperbolic_entail_and_pl_mat.py with an additional
+angular contrastive loss that teaches the model visual content information.
 
-    ViT backbone -> CLS tokens -> MERUStyleProjection (-> hyperboloid, dim D)
-                                        |
-                              LorentzBlock x N  (Lorentzian attention at full dim D)
-                              [frame interaction ON the hyperboloid before splitting]
-                                        |
-                          HyperbolicDimReduction -> dim D/2 (hyperboloid)
-                          HyperbolicDimReduction -> dim D/4 (hyperboloid)
-                                        |
-                     For each scale (D, D/2, D/4):
-                        LorentzScoreHead -> PL scores + refined h
-                        Entailment loss + PL loss
-                                        |
-                     total_loss = sum_s  weight_s * loss_s
-                     (scale weights can be learnable or fixed)
+Key insight (Radial-Angular Decomposition):
+    On the Lorentz hyperboloid, each embedding h_space decomposes into:
+        - radial:  r = ||h_space||   → constrained by entailment + PL losses
+        - angular: â = h_space / ||h||→ constrained by angular contrastive loss
+
+    The gradients of radial losses and angular losses are orthogonal at h_space,
+    so they do not interfere with each other during optimization.
+
+Architecture:
+    Input: x_temporal (B,T,3,H,W) + x_contrast (B,K,3,H,W)
+        │
+        ▼  Shared ViT + MERUStyleProjection
+        │
+        ├── h_temporal (B,T,D) ──→ [Radial Branch: existing MAT pipeline]
+        │                            Pre-split LorentzBlocks → Multi-scale split
+        │                            → Per-scale LorentzScoreHead
+        │                            → Entailment + PL losses
+        │
+        └── h_contrast (B,K,D) ──→ [Angular Branch: new]
+             + h_temporal[:,selected]    Angular decomposition (â = h/||h||)
+                                         → AngularProjectionHead
+                                         → InfoNCE contrastive loss
+
+    Total loss = Σ_s w_s · L_ordering_s  +  λ_ang · L_angular
 """
 from __future__ import absolute_import, division, print_function
 
@@ -29,7 +40,6 @@ import random
 import math
 import numpy as np
 from datetime import timedelta
-from typing import Optional, List
 
 import torch
 import torch.nn as nn
@@ -56,144 +66,35 @@ from models.temporal_vit import (
     hyperbolic_cone_accuracy,
 )
 from models.lorentz_head import LorentzScoreHead, LorentzBlock
+from models.angular_head import (
+    AngularDecomposition,
+    AngularProjectionHead,
+    AngularContrastiveLoss,
+)
 from models import lorentz_ops as L
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
-from utils.data_utils import get_loader
+from utils.data_utils_angular import get_angular_loader
+
+# Re-use dimension reduction and scale weights from the MAT module
+from train_hyperbolic_entail_and_pl_mat import (
+    HyperbolicDimReduction,
+    LearnableScaleWeights,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # =============================================
-# Hyperbolic Dimension Reduction
+# Model: MAT + Angular Contrastive
 # =============================================
 
-class HyperbolicDimReduction(nn.Module):
+class MultiScaleAngularModel(nn.Module):
     """
-    Reduce embedding dimension while staying on the Lorentz hyperboloid.
+    Multi-Scale Hyperbolic MAT model with Angular Contrastive branch.
 
-    Flow:
-        h_space (B, D_in) on hyperboloid
-            -> log_map0  -> tangent vector (B, D_in)   [Euclidean]
-            -> LayerNorm -> Linear(D_in, D_out) -> GELU -> Linear(D_out, D_out)
-            -> exp_map0  -> h_space (B, D_out)          [hyperboloid]
-    """
-
-    def __init__(self, in_dim: int, out_dim: int):
-        super().__init__()
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        self.norm = nn.LayerNorm(in_dim)
-        self.fc1 = nn.Linear(in_dim, out_dim)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(out_dim, out_dim)
-
-        nn.init.xavier_uniform_(self.fc1.weight, gain=0.1)
-        nn.init.zeros_(self.fc1.bias)
-        nn.init.xavier_uniform_(self.fc2.weight, gain=0.1)
-        nn.init.zeros_(self.fc2.bias)
-
-    def forward(self, h: torch.Tensor, curv: torch.Tensor) -> torch.Tensor:
-        orig_shape = h.shape[:-1]
-        D_in = h.shape[-1]
-        h_flat = h.reshape(-1, D_in)
-
-        if h_flat.device.type == "cuda":
-            with torch.autocast("cuda", dtype=torch.float32):
-                h_tan = L.log_map0(h_flat.float(), curv)
-        else:
-            h_tan = L.log_map0(h_flat.float(), curv)
-
-        h_tan = self.norm(h_tan)
-        h_tan = self.fc1(h_tan)
-        h_tan = self.act(h_tan)
-        h_tan = self.fc2(h_tan)
-
-        if h_flat.device.type == "cuda":
-            with torch.autocast("cuda", dtype=torch.float32):
-                h_out = L.exp_map0(h_tan.float(), curv)
-        else:
-            h_out = L.exp_map0(h_tan.float(), curv)
-
-        h_out = L.clamp_norm(h_out, max_norm=30.0)  # prevent norm explosion
-
-        return h_out.reshape(*orig_shape, self.out_dim)
-
-
-# =============================================
-# Scale Weights (learnable or fixed)
-# =============================================
-
-class ScaleWeights(nn.Module):
-    """
-    Weights for combining multi-scale losses.
-
-    Supports two modes:
-      1) Learnable: softmax-normalized logits with temperature (original behavior)
-      2) Fixed: constant weights provided at init (no learnable params)
-
-    Args:
-        n_scales:       number of scales (default 3)
-        init_temp:      initial temperature for learnable softmax
-        min_weight:     minimum weight per scale (learnable mode only)
-        fixed_weights:  if provided (list of n_scales floats summing to 1),
-                        use fixed weights instead of learnable ones
-    """
-
-    def __init__(self, n_scales: int = 3, init_temp: float = 1.0,
-                 min_weight: float = 0.01,
-                 fixed_weights: Optional[List[float]] = None):
-        super().__init__()
-        self.n_scales = n_scales
-
-        if fixed_weights is not None:
-            assert len(fixed_weights) == n_scales, \
-                f"fixed_weights length ({len(fixed_weights)}) != n_scales ({n_scales})"
-            assert abs(sum(fixed_weights) - 1.0) < 1e-5, \
-                f"fixed_weights must sum to 1.0, got {sum(fixed_weights)}"
-            self.register_buffer('_fixed_weights', torch.tensor(fixed_weights, dtype=torch.float32))
-            self._learnable = False
-            self.min_weight = min_weight
-        else:
-            assert 0.0 <= min_weight < 1.0 / n_scales, \
-                f"min_weight must be in [0, 1/n_scales), got {min_weight}"
-            self.logits = nn.Parameter(torch.zeros(n_scales))
-            self.log_temp = nn.Parameter(torch.tensor(init_temp).log())
-            self.min_weight = min_weight
-            self._learnable = True
-
-    def forward(self) -> torch.Tensor:
-        """Returns (n_scales,) tensor of positive weights summing to 1."""
-        if not self._learnable:
-            return self._fixed_weights
-
-        temp = self.log_temp.exp().clamp(min=0.01, max=10.0)
-        soft_w = F.softmax(self.logits / temp, dim=0)
-        w = (1.0 - self.n_scales * self.min_weight) * soft_w + self.min_weight
-        return w
-
-    @property
-    def temperature(self) -> torch.Tensor:
-        if self._learnable:
-            return self.log_temp.exp().clamp(min=0.01, max=10.0)
-        return torch.tensor(0.0)  # placeholder for fixed mode
-
-    @property
-    def is_learnable(self) -> bool:
-        return self._learnable
-
-
-# Keep backward-compatible alias
-LearnableScaleWeights = ScaleWeights
-
-
-# =============================================
-# Multi-Scale Combined Model (v2)
-# =============================================
-
-class MultiScaleHyperbolicCombinedModel(nn.Module):
-    """
-    ViT -> MERUStyleProjection -> [Pre-split LorentzBlocks] -> Multi-scale split
-    -> Per-scale LorentzScoreHead -> scores + refined embeddings
+    Extends MultiScaleHyperbolicCombinedModel with:
+      - AngularDecomposition: extracts angular components from h_space
+      - AngularProjectionHead: projects angular components for contrastive loss
     """
 
     def __init__(
@@ -204,8 +105,6 @@ class MultiScaleHyperbolicCombinedModel(nn.Module):
         embed_dim: int = 128,
         curv_init: float = 1.0,
         learn_curv: bool = True,
-        learn_alpha: bool = True,
-        alpha_init: float = None,
         # Pre-split Lorentz interaction
         pre_split_n_layers: int = 2,
         pre_split_n_heads: int = 4,
@@ -219,7 +118,8 @@ class MultiScaleHyperbolicCombinedModel(nn.Module):
         # Scale weight
         scale_weight_temp: float = 1.0,
         scale_min_weight: float = 0.01,
-        fixed_scale_weights: Optional[List[float]] = None,
+        # Angular contrastive
+        angular_proj_dim: int = 128,
         zero_head: bool = True,
         vis: bool = False,
     ):
@@ -229,7 +129,7 @@ class MultiScaleHyperbolicCombinedModel(nn.Module):
         dim_half = embed_dim // 2
         dim_quarter = embed_dim // 4
 
-        # -- Encoder: ViT -> hyperboloid (dim D) --
+        # ── Encoder: ViT → hyperboloid (dim D) ──
         self.encoder = HyperbolicTemporalViT(
             config,
             img_size=img_size,
@@ -237,13 +137,11 @@ class MultiScaleHyperbolicCombinedModel(nn.Module):
             embed_dim=embed_dim,
             curv_init=curv_init,
             learn_curv=learn_curv,
-            learn_alpha=learn_alpha,
-            alpha_init=alpha_init,
             zero_head=zero_head,
             vis=vis,
         )
 
-        # -- Pre-split Lorentz interaction blocks (full dim D) --
+        # ── Pre-split Lorentz interaction blocks (full dim D) ──
         def _safe_heads(dim, desired_heads):
             h = desired_heads
             while dim % h != 0 and h > 1:
@@ -260,11 +158,11 @@ class MultiScaleHyperbolicCombinedModel(nn.Module):
             for _ in range(pre_split_n_layers)
         ])
 
-        # -- Hyperbolic dimension reductions --
+        # ── Hyperbolic dimension reductions ──
         self.reduce_half = HyperbolicDimReduction(embed_dim, dim_half)
         self.reduce_quarter = HyperbolicDimReduction(embed_dim, dim_quarter)
 
-        # -- Per-scale Lorentz Score Heads --
+        # ── Per-scale Lorentz Score Heads ──
         self.score_head_full = LorentzScoreHead(
             embed_dim=embed_dim,
             n_layers=score_n_layers,
@@ -287,66 +185,163 @@ class MultiScaleHyperbolicCombinedModel(nn.Module):
             dropout=score_dropout,
         )
 
-        # -- Scale weights (learnable or fixed) --
-        self.scale_weights = ScaleWeights(
-            n_scales=3,
-            init_temp=scale_weight_temp,
+        # ── Learnable scale weights ──
+        self.scale_weights = LearnableScaleWeights(
+            n_scales=3, init_temp=scale_weight_temp,
             min_weight=scale_min_weight,
-            fixed_weights=fixed_scale_weights,
+        )
+
+        # ── Angular Contrastive branch ──
+        self.angular_decomp = AngularDecomposition()
+        self.angular_proj = AngularProjectionHead(
+            in_dim=embed_dim,
+            proj_dim=angular_proj_dim,
         )
 
         self.embed_dim = embed_dim
         self.dim_half = dim_half
         self.dim_quarter = dim_quarter
 
-    def forward(self, x: torch.Tensor):
+    def encode_frames(self, x: torch.Tensor) -> torch.Tensor:
         """
+        Encode raw frames to hyperboloid embeddings.
+
         Args:
-            x: (B, T, 3, H, W)
+            x: (N, 3, H, W) individual frames (NOT batched temporal clips)
         Returns:
-            dict with 'full', 'half', 'quarter' sub-dicts and 'scale_weights'
+            (N, D) space components on hyperboloid
+        """
+        encoded, _ = self.encoder.backbone.transformer(x)
+        cls = encoded[:, 0]                           # (N, hidden_size)
+        h = self.encoder.lorentz_proj(cls)             # (N, D) on hyperboloid
+        return h
+
+    def forward_temporal(self, x_temporal: torch.Tensor):
+        """
+        Forward pass for the temporal ordering (radial) branch.
+
+        Args:
+            x_temporal: (B, T, 3, H, W)
+        Returns:
+            dict with multi-scale outputs (same as original MAT)
+            h_proj_raw: (B, T, D) embeddings BEFORE pre-split blocks
+                        (used for angular decomposition)
         """
         curv = self.encoder.curvature
 
-        # -- Full-scale hyperbolic embeddings --
-        h = self.encoder(x)  # (B, T, D) on hyperboloid
+        # Encode to hyperboloid
+        h = self.encoder(x_temporal)    # (B, T, D)
+        h_proj_raw = h                  # Save for angular branch
 
-        # -- Pre-split Lorentz interaction (on hyperboloid at full D) --
+        # Pre-split Lorentz interaction
         for block in self.pre_split_blocks:
             h = block(h, curv)
 
         h_full = h
 
-        # -- Reduce to half and quarter (on hyperboloid) --
-        h_half = self.reduce_half(h_full, curv)        # (B, T, D/2)
-        h_quarter = self.reduce_quarter(h_full, curv)  # (B, T, D/4)
+        # Multi-scale split
+        h_half = self.reduce_half(h_full, curv)
+        h_quarter = self.reduce_quarter(h_full, curv)
 
-        # -- Score heads at each scale --
+        # Score heads
         scores_full, h_ref_full = self.score_head_full(h_full, curv)
         scores_half, h_ref_half = self.score_head_half(h_half, curv)
         scores_quarter, h_ref_quarter = self.score_head_quarter(h_quarter, curv)
 
-        # -- Scale weights --
-        sw = self.scale_weights()  # (3,)
+        sw = self.scale_weights()
 
         return {
-            'full': {
-                'h_proj': h_full,
-                'scores': scores_full,
-                'h_ref': h_ref_full,
-            },
-            'half': {
-                'h_proj': h_half,
-                'scores': scores_half,
-                'h_ref': h_ref_half,
-            },
-            'quarter': {
-                'h_proj': h_quarter,
-                'scores': scores_quarter,
-                'h_ref': h_ref_quarter,
-            },
+            'full': {'h_proj': h_full, 'scores': scores_full, 'h_ref': h_ref_full},
+            'half': {'h_proj': h_half, 'scores': scores_half, 'h_ref': h_ref_half},
+            'quarter': {'h_proj': h_quarter, 'scores': scores_quarter, 'h_ref': h_ref_quarter},
             'scale_weights': sw,
+            'h_proj_raw': h_proj_raw,
         }
+
+    def forward_angular(
+        self,
+        h_temporal_selected: torch.Tensor,
+        h_contrast: torch.Tensor,
+    ):
+        """
+        Forward pass for the angular contrastive branch.
+
+        Args:
+            h_temporal_selected: (B*K, D) hyperboloid embeddings of selected frames
+                                 (from augmentation A)
+            h_contrast:          (B*K, D) hyperboloid embeddings of same frames
+                                 (from augmentation B)
+        Returns:
+            z_temporal: (B*K, proj_dim) projected angular features
+            z_contrast: (B*K, proj_dim) projected angular features
+            angular_stats: dict with norms and angular cosine sim for logging
+        """
+        # Angular decomposition
+        r_temporal, a_temporal = self.angular_decomp(h_temporal_selected)
+        r_contrast, a_contrast = self.angular_decomp(h_contrast)
+
+        # Projection head
+        z_temporal = self.angular_proj(a_temporal)
+        z_contrast = self.angular_proj(a_contrast)
+
+        # Stats for logging
+        with torch.no_grad():
+            # Cosine similarity between paired angular components
+            cos_sim = F.cosine_similarity(a_temporal, a_contrast, dim=-1).mean()
+
+        angular_stats = {
+            'radial_mean_temporal': r_temporal.mean().item(),
+            'radial_mean_contrast': r_contrast.mean().item(),
+            'angular_cosine_sim': cos_sim.item(),
+        }
+
+        return z_temporal, z_contrast, angular_stats
+
+    def forward(self, x_temporal, x_contrast=None, contrast_indices=None):
+        """
+        Full forward pass.
+
+        Args:
+            x_temporal:       (B, T, 3, H, W)
+            x_contrast:       (B, K, 3, H, W) or None
+            contrast_indices: (B, K) or None
+        Returns:
+            temporal_out: dict with multi-scale outputs
+            angular_out:  dict with z_temporal, z_contrast, stats (or None)
+        """
+        # ── Temporal (radial) branch ──
+        temporal_out = self.forward_temporal(x_temporal)
+
+        # ── Angular branch ──
+        angular_out = None
+        if x_contrast is not None and contrast_indices is not None:
+            B, K = x_contrast.shape[:2]
+            D = self.embed_dim
+
+            # Encode contrastive views through shared backbone
+            x_contrast_flat = x_contrast.view(B * K, *x_contrast.shape[2:])
+            h_contrast_flat = self.encode_frames(x_contrast_flat)   # (B*K, D)
+
+            # Select corresponding temporal embeddings using indices
+            # h_proj_raw is (B, T, D) — BEFORE pre-split blocks
+            h_raw = temporal_out['h_proj_raw']  # (B, T, D)
+            h_temporal_selected = torch.zeros(B, K, D, device=h_raw.device,
+                                               dtype=h_raw.dtype)
+            for b in range(B):
+                h_temporal_selected[b] = h_raw[b, contrast_indices[b]]
+            h_temporal_flat = h_temporal_selected.view(B * K, D)
+
+            # Forward angular branch
+            z_temporal, z_contrast, angular_stats = self.forward_angular(
+                h_temporal_flat, h_contrast_flat,
+            )
+            angular_out = {
+                'z_temporal': z_temporal,
+                'z_contrast': z_contrast,
+                'stats': angular_stats,
+            }
+
+        return temporal_out, angular_out
 
     @property
     def curvature(self) -> torch.Tensor:
@@ -395,7 +390,6 @@ def set_seed(args):
 
 
 def kendall_tau_accuracy(scores: torch.Tensor) -> float:
-    """Fraction of correctly-ordered pairs (higher score = earlier frame)."""
     B, T = scores.shape
     pred_order = torch.argsort(scores, dim=1, descending=True)
     correct, total = 0, 0
@@ -423,21 +417,13 @@ def setup(args):
     else:
         logger.info("Training from scratch (no pretrained weights)")
 
-    # Parse fixed scale weights if provided
-    fixed_scale_weights = None
-    if args.fixed_scale_weights is not None:
-        fixed_scale_weights = args.fixed_scale_weights
-        logger.info(f"Using FIXED scale weights: {fixed_scale_weights}")
-
-    model = MultiScaleHyperbolicCombinedModel(
+    model = MultiScaleAngularModel(
         config,
         img_size=args.img_size,
         pretrained_weights=pretrained_weights,
         embed_dim=args.embed_dim,
         curv_init=args.curv_init,
         learn_curv=args.learn_curv,
-        learn_alpha=args.learn_alpha,
-        alpha_init=args.alpha_init,
         pre_split_n_layers=args.pre_split_n_layers,
         pre_split_n_heads=args.pre_split_n_heads,
         pre_split_mlp_ratio=args.pre_split_mlp_ratio,
@@ -448,7 +434,7 @@ def setup(args):
         score_dropout=args.score_dropout,
         scale_weight_temp=args.scale_weight_temp,
         scale_min_weight=args.scale_min_weight,
-        fixed_scale_weights=fixed_scale_weights,
+        angular_proj_dim=args.angular_proj_dim,
         zero_head=True,
     )
     model.to(args.device)
@@ -459,17 +445,9 @@ def setup(args):
     logger.info(f"Total trainable parameters: {num_params:.1f}M")
     logger.info(f"Multi-scale dims: full={args.embed_dim}, "
                 f"half={args.embed_dim // 2}, quarter={args.embed_dim // 4}")
-    logger.info(f"Pre-split LorentzBlocks: {args.pre_split_n_layers} layers, "
-                f"{args.pre_split_n_heads} heads")
-    logger.info(f"Curvature: {'LEARNABLE' if args.learn_curv else 'FIXED'} "
-                f"(init={args.curv_init})")
-    logger.info(f"Alpha: {'LEARNABLE' if args.learn_alpha else 'FIXED'} "
-                f"(init={args.alpha_init})")
-    if fixed_scale_weights is not None:
-        logger.info(f"Scale weights: FIXED {fixed_scale_weights}")
-    else:
-        logger.info(f"Scale weights: LEARNABLE (init_temp={args.scale_weight_temp}, "
-                     f"min_weight={args.scale_min_weight})")
+    logger.info(f"Angular contrastive: K={args.contrast_k}, "
+                f"proj_dim={args.angular_proj_dim}, "
+                f"λ={args.angular_weight}, τ={args.angular_temperature}")
     return args, model
 
 
@@ -480,6 +458,10 @@ def setup(args):
 @torch.no_grad()
 def valid(args, model, entailment_criterions, pl_criterion, writer,
           test_loader, global_step):
+    """
+    Validation uses only the temporal ordering metrics (no angular contrastive
+    during validation since the val loader returns single-augmented clips).
+    """
     model.eval()
 
     scale_names = ['full', 'half', 'quarter']
@@ -503,14 +485,19 @@ def valid(args, model, entailment_criterions, pl_criterion, writer,
                           disable=args.local_rank not in [-1, 0])
 
     for step, batch in enumerate(epoch_iterator):
-        x = batch.to(args.device)
-        out = model(x)
-        sw = out['scale_weights']  # (3,)
+        # Val loader returns only x_temporal (no contrast views)
+        if isinstance(batch, (list, tuple)):
+            x = batch[0].to(args.device)
+        else:
+            x = batch.to(args.device)
+
+        temporal_out, _ = model(x)
+        sw = temporal_out['scale_weights']
 
         batch_total_loss = 0.0
         for idx, sname in enumerate(scale_names):
-            h_proj = out[sname]['h_proj']
-            scores = out[sname]['scores']
+            h_proj = temporal_out[sname]['h_proj']
+            scores = temporal_out[sname]['scores']
 
             ent_dict = entailment_criterions[sname](h_proj, _curv)
             pl_loss = pl_criterion(scores)
@@ -555,22 +542,14 @@ def valid(args, model, entailment_criterions, pl_criterion, writer,
                      f"pl_acc={pl_acc:.4f}")
 
         writer.add_scalar(f"val/{sname}/loss", meters[sname]['total'].avg, global_step)
-        writer.add_scalar(f"val/{sname}/entailment_loss", meters[sname]['ent'].avg, global_step)
-        writer.add_scalar(f"val/{sname}/height_loss", meters[sname]['height'].avg, global_step)
-        writer.add_scalar(f"val/{sname}/pl_loss", meters[sname]['pl'].avg, global_step)
         writer.add_scalar(f"val/{sname}/ordering_accuracy", ordering_acc, global_step)
         writer.add_scalar(f"val/{sname}/cone_accuracy", cone_acc, global_step)
         writer.add_scalar(f"val/{sname}/pl_pair_accuracy", pl_acc, global_step)
 
-        log_dict.update({
-            f"val/{sname}/loss": meters[sname]['total'].avg,
-            f"val/{sname}/entailment_loss": meters[sname]['ent'].avg,
-            f"val/{sname}/height_loss": meters[sname]['height'].avg,
-            f"val/{sname}/pl_loss": meters[sname]['pl'].avg,
-            f"val/{sname}/ordering_accuracy": ordering_acc,
-            f"val/{sname}/cone_accuracy": cone_acc,
-            f"val/{sname}/pl_pair_accuracy": pl_acc,
-        })
+        log_dict[f"val/{sname}/loss"] = meters[sname]['total'].avg
+        log_dict[f"val/{sname}/ordering_accuracy"] = ordering_acc
+        log_dict[f"val/{sname}/cone_accuracy"] = cone_acc
+        log_dict[f"val/{sname}/pl_pair_accuracy"] = pl_acc
 
     writer.add_scalar("val/loss", total_meter.avg, global_step)
 
@@ -604,8 +583,8 @@ def train(args, model):
 
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
-    # Data
-    train_loader, test_loader = get_loader(args)
+    # Data (angular-aware loader)
+    train_loader, test_loader = get_angular_loader(args)
 
     # Per-scale entailment losses
     scale_names = ['full', 'half', 'quarter']
@@ -622,6 +601,9 @@ def train(args, model):
         sample=args.pl_sample,
         R=args.pl_R,
         K=args.pl_K,
+    )
+    angular_criterion = AngularContrastiveLoss(
+        temperature=args.angular_temperature,
     )
 
     # Optimizer
@@ -642,25 +624,28 @@ def train(args, model):
     scaler = GradScaler(enabled=args.fp16)
 
     if args.local_rank != -1:
-        model = DDP(model, device_ids=[args.local_rank], find_unused_parameters=False)
+        model = DDP(model, device_ids=[args.local_rank], find_unused_parameters=True)
 
     model_to_use = model.module if hasattr(model, 'module') else model
 
-    logger.info("***** Running Multi-Scale Hyperbolic Entailment + PL Training (v2) *****")
+    logger.info("***** Running Multi-Scale MAT + Angular Contrastive Training *****")
     logger.info(f"  Total optimization steps   = {args.num_steps}")
     logger.info(f"  Batch size per GPU         = {args.train_batch_size}")
     logger.info(f"  Gradient accumulation      = {args.gradient_accumulation_steps}")
     logger.info(f"  Seq len (frames/clip)      = {args.seq_len}")
-    logger.info(f"  Embedding dim              = {args.embed_dim} "
-                f"(scales: {args.embed_dim}, {args.embed_dim//2}, {args.embed_dim//4})")
-    logger.info(f"  Pre-split LorentzBlocks    = {args.pre_split_n_layers} layers")
-    logger.info(f"  Score head layers          = {args.score_n_layers}")
+    logger.info(f"  Contrast K                 = {args.contrast_k}")
+    logger.info(f"  Embedding dim              = {args.embed_dim}")
+    logger.info(f"  Angular weight λ           = {args.angular_weight}")
+    logger.info(f"  Angular temperature τ      = {args.angular_temperature}")
+    logger.info(f"  Angular proj dim           = {args.angular_proj_dim}")
     logger.info(f"  Loss weights: cone={args.cone_weight}, "
                 f"height={args.height_weight}, pl={args.pl_weight}")
 
     model.zero_grad()
     set_seed(args)
     losses = AverageMeter()
+    angular_losses = AverageMeter()
+    angular_accs = AverageMeter()
     global_step, best_loss = 0, float('inf')
 
     while True:
@@ -680,20 +665,26 @@ def train(args, model):
         )
 
         for step, batch in enumerate(epoch_iterator):
-            x = batch.to(args.device)  # [B, T, 3, H, W]
+            x_temporal, x_contrast, contrast_indices = batch
+            x_temporal = x_temporal.to(args.device)
+            x_contrast = x_contrast.to(args.device)
+            contrast_indices = contrast_indices.to(args.device)
 
             with autocast(enabled=args.fp16):
-                out = model(x)
+                # Forward both branches
+                temporal_out, angular_out = model(
+                    x_temporal, x_contrast, contrast_indices
+                )
                 _curv = model_to_use.curvature
-                sw = out['scale_weights']  # (3,)
+                sw = temporal_out['scale_weights']
 
-                # Accumulate loss over all scales with weights
-                total_loss = torch.tensor(0.0, device=x.device)
+                # ── Radial branch: multi-scale ordering loss ──
+                ordering_loss = torch.tensor(0.0, device=x_temporal.device)
                 per_scale_losses = {}
 
                 for idx, sname in enumerate(scale_names):
-                    h_proj = out[sname]['h_proj']
-                    scores = out[sname]['scores']
+                    h_proj = temporal_out[sname]['h_proj']
+                    scores = temporal_out[sname]['scores']
 
                     ent_dict = entailment_criterions[sname](h_proj, _curv)
                     pl_loss = pl_criterion(scores)
@@ -702,7 +693,7 @@ def train(args, model):
                                   + args.height_weight * ent_dict["height_loss"]
                                   + args.pl_weight * pl_loss)
 
-                    total_loss = total_loss + sw[idx] * scale_loss
+                    ordering_loss = ordering_loss + sw[idx] * scale_loss
 
                     per_scale_losses[sname] = {
                         'ent': ent_dict["entailment_loss"].item(),
@@ -711,7 +702,18 @@ def train(args, model):
                         'total': scale_loss.item(),
                     }
 
-                loss = total_loss
+                # ── Angular branch: contrastive loss ──
+                angular_loss_val = torch.tensor(0.0, device=x_temporal.device)
+                angular_acc_val = 0.0
+
+                if angular_out is not None:
+                    angular_loss_val, angular_acc_val = angular_criterion(
+                        angular_out['z_temporal'],
+                        angular_out['z_contrast'],
+                    )
+
+                # ── Total loss ──
+                loss = ordering_loss + args.angular_weight * angular_loss_val
 
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
@@ -720,6 +722,9 @@ def train(args, model):
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 losses.update(loss.item() * args.gradient_accumulation_steps)
+                angular_losses.update(angular_loss_val.item())
+                angular_accs.update(angular_acc_val.item() if isinstance(angular_acc_val, float)
+                                    else angular_acc_val.item())
 
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -739,15 +744,22 @@ def train(args, model):
                 global_step += 1
 
                 epoch_iterator.set_description(
-                    f"Training ({global_step}/{t_total}) (loss={losses.val:.5f})"
+                    f"Training ({global_step}/{t_total}) "
+                    f"(loss={losses.val:.4f} ang={angular_losses.val:.4f})"
                 )
 
                 if args.local_rank in [-1, 0]:
-                    # Current scale weights
                     sw_vals = sw.detach()
 
                     writer.add_scalar("train/loss", losses.val, global_step)
-                    writer.add_scalar("train/lr", scheduler.get_lr()[0], global_step)
+                    writer.add_scalar("train/ordering_loss",
+                                      ordering_loss.item(), global_step)
+                    writer.add_scalar("train/angular_loss",
+                                      angular_loss_val.item(), global_step)
+                    writer.add_scalar("train/angular_acc",
+                                      angular_accs.val, global_step)
+                    writer.add_scalar("train/lr",
+                                      scheduler.get_lr()[0], global_step)
                     writer.add_scalar("train/curvature",
                                       model_to_use.curvature.item(), global_step)
                     writer.add_scalar("train/scale_weight_full",
@@ -757,11 +769,6 @@ def train(args, model):
                     writer.add_scalar("train/scale_weight_quarter",
                                       sw_vals[2].item(), global_step)
 
-                    if model_to_use.scale_weights.is_learnable:
-                        writer.add_scalar("train/scale_weight_temp",
-                                          model_to_use.scale_weights.temperature.item(),
-                                          global_step)
-
                     for sname in scale_names:
                         writer.add_scalar(f"train/{sname}/entailment_loss",
                                           per_scale_losses[sname]['ent'], global_step)
@@ -769,18 +776,14 @@ def train(args, model):
                                           per_scale_losses[sname]['height'], global_step)
                         writer.add_scalar(f"train/{sname}/pl_loss",
                                           per_scale_losses[sname]['pl'], global_step)
-                        writer.add_scalar(f"train/{sname}/total_loss",
-                                          per_scale_losses[sname]['total'], global_step)
 
                     if args.use_wandb:
-                        with torch.no_grad():
-                            h_full_norms = out['full']['h_proj'].float().norm(dim=-1)
-                            h_half_norms = out['half']['h_proj'].float().norm(dim=-1)
-                            h_quarter_norms = out['quarter']['h_proj'].float().norm(dim=-1)
-
                         log_dict = {
                             "train/loss": losses.val,
                             "train/loss_avg": losses.avg,
+                            "train/ordering_loss": ordering_loss.item(),
+                            "train/angular_loss": angular_loss_val.item(),
+                            "train/angular_acc": angular_accs.val,
                             "train/lr": scheduler.get_lr()[0],
                             "train/curvature": model_to_use.curvature.item(),
                             "train/alpha": model_to_use.encoder.lorentz_proj.alpha.exp().item(),
@@ -788,23 +791,25 @@ def train(args, model):
                             "train/scale_weight_full": sw_vals[0].item(),
                             "train/scale_weight_half": sw_vals[1].item(),
                             "train/scale_weight_quarter": sw_vals[2].item(),
-                            "train/embed_norm_full_mean": h_full_norms.mean().item(),
-                            "train/embed_norm_full_max": h_full_norms.max().item(),
-                            "train/embed_norm_half_mean": h_half_norms.mean().item(),
-                            "train/embed_norm_half_max": h_half_norms.max().item(),
-                            "train/embed_norm_quarter_mean": h_quarter_norms.mean().item(),
-                            "train/embed_norm_quarter_max": h_quarter_norms.max().item(),
+                            "train/scale_weight_temp": model_to_use.scale_weights.temperature.item(),
                             "step": global_step,
                         }
-                        if model_to_use.scale_weights.is_learnable:
-                            log_dict["train/scale_weight_temp"] = \
-                                model_to_use.scale_weights.temperature.item()
 
+                        # Angular stats
+                        if angular_out is not None:
+                            for k, v in angular_out['stats'].items():
+                                log_dict[f"train/angular/{k}"] = v
+
+                        # Per-scale losses
                         for sname in scale_names:
-                            log_dict[f"train/{sname}/entailment_loss"] = per_scale_losses[sname]['ent']
-                            log_dict[f"train/{sname}/height_loss"] = per_scale_losses[sname]['height']
-                            log_dict[f"train/{sname}/pl_loss"] = per_scale_losses[sname]['pl']
-                            log_dict[f"train/{sname}/total_loss"] = per_scale_losses[sname]['total']
+                            for k, v in per_scale_losses[sname].items():
+                                log_dict[f"train/{sname}/{k}_loss"] = v
+
+                        # Embedding norms
+                        with torch.no_grad():
+                            h_full_norms = temporal_out['full']['h_proj'].float().norm(dim=-1)
+                            log_dict["train/embed_norm_full_mean"] = h_full_norms.mean().item()
+                            log_dict["train/embed_norm_full_max"] = h_full_norms.max().item()
 
                         wandb.log(log_dict)
 
@@ -826,6 +831,8 @@ def train(args, model):
                     break
 
         losses.reset()
+        angular_losses.reset()
+        angular_accs.reset()
         if global_step >= t_total:
             break
 
@@ -871,19 +878,10 @@ def main():
                         choices=["randstep", "global"])
 
     # Hyperbolic (MERU-style)
-    parser.add_argument("--embed_dim", default=128, type=int,
-                        help="Full-scale hyperbolic embedding dim (must be divisible by 4).")
+    parser.add_argument("--embed_dim", default=128, type=int)
     parser.add_argument("--curv_init", default=1.0, type=float)
     parser.add_argument("--learn_curv", action="store_true", default=True)
     parser.add_argument("--no_learn_curv", dest="learn_curv", action="store_false")
-
-    # Alpha scaling
-    parser.add_argument("--learn_alpha", action="store_true", default=True,
-                        help="Learn the alpha scaling parameter during training.")
-    parser.add_argument("--no_learn_alpha", dest="learn_alpha", action="store_false",
-                        help="Fix the alpha scaling parameter.")
-    parser.add_argument("--alpha_init", type=float, default=None,
-                        help="Initial alpha value. If None, uses embed_dim^{-0.5}.")
 
     # Pre-split Lorentz interaction
     parser.add_argument("--pre_split_n_layers", default=2, type=int)
@@ -903,21 +901,26 @@ def main():
     parser.add_argument("--pl_R", default=4, type=int)
     parser.add_argument("--pl_K", default=8, type=int)
 
-    # Scale weights
-    parser.add_argument("--scale_weight_temp", default=1.0, type=float,
-                        help="Initial temperature for learnable scale weight softmax.")
-    parser.add_argument("--scale_min_weight", default=0.01, type=float,
-                        help="Minimum weight per scale (learnable mode only).")
-    parser.add_argument("--fixed_scale_weights", nargs=3, type=float, default=None,
-                        help="Fixed scale weights for [full, half, quarter]. "
-                             "Must sum to 1.0. If set, scale weights are NOT learned. "
-                             "Example: --fixed_scale_weights 0.34 0.33 0.33")
+    # Learnable scale weights
+    parser.add_argument("--scale_weight_temp", default=1.0, type=float)
+    parser.add_argument("--scale_min_weight", default=0.01, type=float)
 
     # Per-scale Lorentz Score Head
     parser.add_argument("--score_n_layers", default=2, type=int)
     parser.add_argument("--score_n_heads", default=4, type=int)
     parser.add_argument("--score_mlp_ratio", default=4.0, type=float)
     parser.add_argument("--score_dropout", default=0.1, type=float)
+
+    # ── Angular Contrastive (NEW) ──
+    parser.add_argument("--contrast_k", default=2, type=int,
+                        help="Number of frames per clip for contrastive pairs. "
+                             "Higher = better contrastive signal but more compute.")
+    parser.add_argument("--angular_weight", default=0.5, type=float,
+                        help="Weight λ for angular contrastive loss in total loss.")
+    parser.add_argument("--angular_temperature", default=0.1, type=float,
+                        help="Temperature τ for InfoNCE contrastive loss.")
+    parser.add_argument("--angular_proj_dim", default=128, type=int,
+                        help="Projection dimension for angular contrastive head.")
 
     # Training
     parser.add_argument("--train_batch_size", default=32, type=int)
